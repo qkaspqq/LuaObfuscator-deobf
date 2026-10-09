@@ -326,6 +326,7 @@ SIMPLE = [
 ]
 
 _CLOSURE_ENV = re.compile(r"__index=function")
+_CLOSURE_MAKE = re.compile(r"R\[I\[2\]\]=V\(V,V,V\)$")
 
 
 def _balanced(t):
@@ -547,6 +548,20 @@ def _strip_runtime(payload, ctx):
     return payload
 
 
+def _split_on_fetch(payload, ctx):
+    instr, pc, code = ctx.get("instr"), ctx.get("pc"), ctx.get("code")
+    if not (instr and pc and code):
+        return [payload]
+    fetch = re.compile(re.escape(instr) + r"\s*=\s*" + re.escape(code)
+                       + r"\s*\[" + re.escape(pc) + r"\]\s*;")
+    parts, last = [], 0
+    for m in fetch.finditer(payload):
+        parts.append(payload[last:m.start()])
+        last = m.end()
+    parts.append(payload[last:])
+    return [x for x in parts if x.strip()]
+
+
 def unflatten_blocks(body, ctx):
     m = re.search(r"local\s+(\w+)\s*=\s*([^;]+);"
                   r"(?:\s*local\s+\w+\s*;)*\s*while true do", body)
@@ -586,12 +601,13 @@ def unflatten_blocks(body, ctx):
         return None
     out = []
     for p in order:
-        p = _strip_runtime(p, ctx)
-        p = re.sub(r"\b" + re.escape(state) + r"\s*=\s*[^;]+;", ";", p)
-        p = re.sub(r"\bbreak\s*;", ";", p)
-        p = p.strip().strip(";").strip()
-        if p:
-            out.append(p)
+        for piece in _split_on_fetch(p, ctx):
+            piece = _strip_runtime(piece, ctx)
+            piece = re.sub(r"\b" + re.escape(state) + r"\s*=\s*[^;]+;", ";", piece)
+            piece = re.sub(r"\bbreak\s*;", ";", piece)
+            piece = piece.strip().strip(";").strip()
+            if piece:
+                out.append(piece)
     return out or None
 
 
@@ -657,7 +673,7 @@ def _match(norm, ins):
         if ops:
             return ops
 
-    if _CLOSURE_ENV.search(norm):
+    if _CLOSURE_ENV.search(norm) or _CLOSURE_MAKE.search(norm):
         return [("CLOSURE", _reg(ins, "A"), _reg(ins, "B"), _reg(ins, "C"))]
 
     for pat, fn in SIMPLE:
