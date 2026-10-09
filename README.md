@@ -137,7 +137,7 @@ luaobf_deobf.py     CLI ─ detection, payload decode, container parsing,
 lua51_chunk.py      writes a standard Lua 5.1 binary chunk
 vm_isa.py           interpreter body shape  ->  Lua 5.1 ops
 vm_to_lua.py        VM bytecode  ->  Lua 5.1 function tree
-vendor/unluac/      bundled unluac (MIT) ─ the final Lua decompiler
+vendor/unluac.jar   bundled unluac (MIT) ─ the final Lua decompiler
 examples/           sample outputs
 ```
 
@@ -148,6 +148,6 @@ examples/           sample outputs
 * **Author** ─ **qkaspq**
 * **Discord** ─ unlimited env logger & deobfuscators:
   [discord.gg/etcQYYjpxp](https://discord.gg/etcQYYjpxp)
-* **unluac** ─ the Lua 5.1 decompiler bundled in `vendor/unluac/`.
+* **unluac** ─ the Lua 5.1 decompiler bundled as `vendor/unluac.jar`.
   MIT licensed, © 2011–2015 tehtmi, portions © 2014 Thomas Klaeger.
-  See [`vendor/unluac/LICENSE`](vendor/unluac/LICENSE).
+  See [`vendor/unluac-LICENSE.txt`](vendor/unluac-LICENSE.txt).
