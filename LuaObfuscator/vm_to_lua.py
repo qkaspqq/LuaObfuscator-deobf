@@ -6,6 +6,8 @@ import vm_isa
 
 
 def _steps(body, instr, ctx):
+    if D.classify_op(body, (ctx or {}).get("regs")) == "CLOSURE":
+        return [body.strip()]
     split = D.split_op_steps(body, instr)
     if "while true do" in body:
         blocks = vm_isa.unflatten_blocks(body, ctx)
@@ -176,6 +178,21 @@ def _read_counts(ops, nreg):
     return rc
 
 
+_RK_POS = {
+    "GETTABLE": (3,), "SETTABLE": (2, 3), "SELF": (3,),
+    "ADD": (2, 3), "SUB": (2, 3), "MUL": (2, 3), "DIV": (2, 3),
+    "MOD": (2, 3), "POW": (2, 3), "EQ": (2, 3), "LT": (2, 3), "LE": (2, 3),
+}
+
+_REG_OPS = {
+    "MOVE", "LOADBOOL", "LOADNIL", "GETUPVAL", "GETTABLE", "SETUPVAL",
+    "SETTABLE", "NEWTABLE", "SELF", "ADD", "SUB", "MUL", "DIV", "MOD",
+    "POW", "UNM", "NOT", "LEN", "CONCAT", "EQ", "LT", "LE", "TEST",
+    "TESTSET", "CALL", "TAILCALL", "RETURN", "TFORLOOP", "SETLIST",
+    "VARARG", "CLOSE",
+}
+
+
 def _valid_ops(ops, nconst, nproto):
     for op in ops:
         name = op[0]
@@ -193,6 +210,14 @@ def _valid_ops(ops, nconst, nproto):
                 return False
             if isinstance(v, int) and v >= 256 and not (256 <= v < 256 + nconst):
                 return False
+        if name in _REG_OPS:
+            rk = _RK_POS.get(name, ())
+            for pos in (2, 3):
+                if pos in rk:
+                    continue
+                v = op[pos] if pos < len(op) else None
+                if isinstance(v, int) and v >= 200:
+                    return False
         mode = L.OPMODE.get(name)
         if mode == L.IABC:
             for v in (b, c):
