@@ -664,9 +664,6 @@ def _unflatten(body, ctx):
 
 
 def _super_ops(norm, ins):
-    # CALL returning a value, then branch on the first return. The target is
-    # taken only when that value is truthy. Rebase the call frame two registers
-    # forward so CALL results land at A+2, matching the obfuscated handler.
     call_test = re.fullmatch(
         r"localV=I\[2\];localV=I\[4\];localV=V\+2;"
         r"localV=\{R\[V\]\(R\[V\+1\],R\[V\]\)\};"
@@ -684,7 +681,6 @@ def _super_ops(norm, ins):
             ("JMP", 0, _target_from_b(ins), None),
         ]
 
-    # The handler appends R[A+1..B] to table R[A] via table.insert.
     if re.fullmatch(
         r"localV=I\[2\];localV=R\[V\];"
         r"forV=V\+1,I\[3\]doV\(V,R\[V\]\);end", norm):
@@ -693,8 +689,6 @@ def _super_ops(norm, ins):
             return None
         return [("SETLIST", a, upper - a, 1)]
 
-    # TESTSET variant hidden behind an opaque state-machine wrapper. The
-    # handler copies R[C] to R[A] and jumps to B only when R[C] is falsey.
     if re.fullmatch(
         r"V=R\[I\[4\]\];ifVthen(?:PC=PC\+1;)?;?elselocalV=0;whiletruedo"
         r"if\(\(V==0\)or\(\d+==\d+\)\)thenR\[I\[2\]\]=V;"
@@ -702,8 +696,6 @@ def _super_ops(norm, ins):
         return [("TESTSET", _reg(ins, "A"), _reg(ins, "C"), 1),
                 ("JMP", 0, _target_from_b(ins), None)]
 
-    # Closing open upvalues at/above A is Lua 5.1 CLOSE. Two equivalent
-    # handler families are used: direct scanning and scanning closure records.
     if (re.fullmatch(
             r"localV=I\[2\];localV=\{\};forV=1,#VdolocalV=V\[V\];"
             r"forV=0,#VdolocalV=V\[V\];localV=V\[1\];localV=V\[2\];"
@@ -715,8 +707,6 @@ def _super_ops(norm, ins):
             r"(?:or\(\d+==\d+\))?\)thenV\[V\]=V\[V\];V\[1\]=V;endend", norm)):
         return [("CLOSE", _reg(ins, "A"), 0, 0)]
 
-    # Numeric FORLOOP: this family advances R[A], then branches back to B
-    # only while the new index remains within the limit.
     for_loop = re.fullmatch(
         r"(?:local)?V=I\[2\];(?:local)?V=R\[V\+2\];"
         r"(?:local)?V=R\[V\]\+V;R\[V\]=V;"
@@ -730,8 +720,6 @@ def _super_ops(norm, ins):
             return None
         return [("FORLOOP_CONTINUE", _reg(ins, "A"), _target_from_b(ins), None)]
 
-    # A sibling numeric-loop handler receives an already advanced index; it
-    # jumps to B on exhaustion and otherwise publishes R[A+3].
     for_exit = re.fullmatch(
         r"(?:local)?V=I\[2\];(?:local)?V=R\[V\];(?:local)?V=R\[V\+2\];"
         r"(?:if\(V>0\)then|if\(\(\d+<\d+\)and\(V>0\)\)then)"
@@ -756,7 +744,7 @@ def _match(norm, ins):
     special = _super_ops(norm, ins)
     if special:
         return special
-    if norm.startswith("if") and norm.endswith("end"): 
+    if norm.startswith("if") and norm.endswith("end"):
         parts = _split_if(norm)
         if parts:
             ops = _cond_ops(parts[0], parts[1], parts[2], ins)
