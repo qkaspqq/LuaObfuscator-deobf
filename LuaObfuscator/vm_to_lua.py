@@ -5,6 +5,97 @@ import luaobf_deobf as D
 import vm_isa
 
 
+def _opaque(s):
+    for ch in s:
+        c = ord(ch)
+        if c > 126 or (c < 32 and ch not in "\t\n\r"):
+            return True
+    return False
+
+
+_NAME_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 _.-:/")
+
+
+def _plain(b):
+    if not b:
+        return False
+    letters = False
+    for c in b:
+        if c > 126 or chr(c) not in _NAME_CHARS:
+            return False
+        if 65 <= c <= 90 or 97 <= c <= 122:
+            letters = True
+    return letters
+
+
+def _const_refs(code, nconst):
+    loads = [0] * nconst
+    globs = [0] * nconst
+    for w in code:
+        name, _a, b, c = _decode(w)
+        if name in ("GETGLOBAL", "SETGLOBAL"):
+            if isinstance(b, int) and 0 <= b < nconst:
+                globs[b] += 1
+            continue
+        if name == "LOADK":
+            if isinstance(b, int) and 0 <= b < nconst:
+                loads[b] += 1
+            continue
+        for v in (b, c):
+            if isinstance(v, int) and 256 <= v < 256 + nconst:
+                loads[v - 256] += 1
+    return loads, globs
+
+
+_ALPHA = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+_DIGIT = frozenset("0123456789")
+
+
+def _is_ident(s):
+    if not s or (s[0] not in _ALPHA and s[0] != "_"):
+        return False
+    return all(c in _ALPHA or c in _DIGIT or c == "_" for c in s)
+
+
+def _sanitize_globals(consts, code):
+    _, globs = _const_refs(code, len(consts))
+    out = list(consts)
+    for i, n in enumerate(globs):
+        if not n:
+            continue
+        v = out[i]
+        if isinstance(v, str) and v and not _is_ident(v):
+            out[i] = "_g_%d_%s" % (i, v.encode("latin-1", "replace").hex())
+    return out
+
+
+def _decrypt_consts(consts, code):
+    if os.environ.get("VM_STRINGS", "1") == "0":
+        return consts
+    out = list(consts)
+    loads, globs = _const_refs(code, len(consts))
+    used = set()
+    for i in range(len(consts) - 1):
+        if i in used:
+            continue
+        data, key = consts[i], consts[i + 1]
+        if not (isinstance(data, str) and isinstance(key, str) and data and key):
+            continue
+        if not _opaque(data):
+            continue
+        res = D.xor_decode(data.encode("latin-1", "replace"),
+                           key.encode("latin-1", "replace"))
+        if not _plain(res):
+            continue
+        out[i] = res.decode("latin-1")
+        if loads[i + 1] == 1 and not globs[i + 1]:
+            out[i + 1] = "\x00" * len(key.encode("latin-1", "replace"))
+            used.add(i + 1)
+        used.add(i)
+    return out
+
+
 def _steps(body, instr, ctx):
     if D.classify_op(body, (ctx or {}).get("regs")) == "CLOSURE":
         return [body.strip()]
@@ -198,6 +289,13 @@ def _valid_ops(ops, nconst, nproto):
         name = op[0]
         if name == "JMP":
             continue
+        if name == "JMP_LOCAL":
+            target = op[2]
+            if not isinstance(target, int) or not 0 <= target <= len(ops):
+                return False
+            continue
+        if name in ("FORLOOP_EXIT", "FORLOOP_CONTINUE"):
+            return False
         a, b, c = op[1], op[2], op[3]
         if name in ("LOADK", "GETGLOBAL", "SETGLOBAL"):
             if not (0 <= b < nconst):
@@ -231,6 +329,56 @@ def _valid_ops(ops, nconst, nproto):
     return True
 
 
+def _expand_macros(ops, consts):
+    out = []
+    for op in ops:
+        if op[0] not in ("FORLOOP_EXIT", "FORLOOP_CONTINUE"):
+            out.append(op)
+            continue
+        kind, a, target = op[0], op[1], op[2]
+        if not isinstance(a, int) or a < 0 or a + 3 >= 200:
+            return None
+        zero = next((i for i, value in enumerate(consts)
+                     if not isinstance(value, bool)
+                     and isinstance(value, (int, float)) and value == 0), None)
+        if zero is None:
+            if len(consts) >= 256:
+                return None
+            zero = len(consts)
+            consts.append(0.0)
+        zero_rk = _RK + zero
+        base = len(out)
+        if kind == "FORLOOP_EXIT":
+            out.extend((
+                ("LE", 1, a + 2, zero_rk),
+                ("JMP_LOCAL", 0, base + 6, None),
+                ("LT", 1, a + 1, a),
+                ("JMP", 0, target, None),
+                ("MOVE", a + 3, a, None),
+                ("JMP_LOCAL", 0, base + 9, None),
+                ("LT", 1, a, a + 1),
+                ("JMP", 0, target, None),
+                ("MOVE", a + 3, a, None),
+            ))
+        else:
+            out.extend((
+                ("ADD", a, a, a + 2),
+                ("LE", 1, a + 2, zero_rk),
+                ("JMP_LOCAL", 0, base + 6, None),
+                ("LE", 1, a, a + 1),
+                ("JMP_LOCAL", 0, base + 9, None),
+                ("JMP_LOCAL", 0, base + 13, None),
+                ("LE", 1, a + 1, a),
+                ("JMP_LOCAL", 0, base + 11, None),
+                ("JMP_LOCAL", 0, base + 13, None),
+                ("MOVE", a + 3, a, None),
+                ("JMP", 0, target, None),
+                ("MOVE", a + 3, a, None),
+                ("JMP", 0, target, None),
+            ))
+    return out
+
+
 def _consts_ok(ops, consts):
     for op in ops:
         if op[0] in ("GETGLOBAL", "SETGLOBAL"):
@@ -250,28 +398,37 @@ def build_function(chunk, isa, instr, regs, ctx=None, depth=0):
 
     consts = list(chunk["consts"])
 
-    nconst = len(consts)
     nproto = len(chunk["protos"])
 
     lua_ops = []
     atom_of = []
     for i, a in enumerate(atoms):
         ops = vm_isa.emit(a["text"], a["ins"], ctx)
+        if ops:
+            ops = _expand_macros(ops, consts)
+        nconst = len(consts)
         if ops and _valid_ops(ops, nconst, nproto) and _consts_ok(ops, consts):
-            for o in ops:
-                lua_ops.append(o)
+            base = len(lua_ops)
+            for op in ops:
+                if op[0] == "JMP_LOCAL":
+                    op = (op[0], op[1], base + op[2], op[3])
+                lua_ops.append(op)
                 atom_of.append(i)
         else:
             lua_ops.append(("__RAW__", a["sem"], a["text"], i))
             atom_of.append(i)
 
-    dedup, datom = [], []
-    for op, ai in zip(lua_ops, atom_of):
-        if (op[0] == "JMP" and dedup and dedup[-1][0] == "JMP"
-                and dedup[-1][2] == op[2]):
-            continue
-        dedup.append(op)
-        datom.append(ai)
+    has_local_jumps = any(op[0] == "JMP_LOCAL" for op in lua_ops)
+    if has_local_jumps:
+        dedup, datom = lua_ops, atom_of
+    else:
+        dedup, datom = [], []
+        for op, ai in zip(lua_ops, atom_of):
+            if (op[0] == "JMP" and dedup and dedup[-1][0] == "JMP"
+                    and dedup[-1][2] == op[2]):
+                continue
+            dedup.append(op)
+            datom.append(ai)
     lua_ops, atom_of = dedup, datom
 
     atom2lua = {}
@@ -301,8 +458,12 @@ def build_function(chunk, isa, instr, regs, ctx=None, depth=0):
         name = op[0]
         if name == "__RAW__":
             continue
-        if name == "JMP":
-            tgt_lua = _resolve(op[2])
+        if name in ("JMP", "JMP_LOCAL"):
+            if name == "JMP_LOCAL":
+                tgt_lua = sum(1 for previous in lua_ops[:op[2]]
+                              if previous[0] != "__RAW__")
+            else:
+                tgt_lua = _resolve(op[2])
             if tgt_lua is None:
                 tgt_lua = total_out
             tgt_lua = min(max(tgt_lua, 0), total_out)
@@ -377,7 +538,7 @@ def build_function(chunk, isa, instr, regs, ctx=None, depth=0):
         is_vararg=2 if depth == 0 else 0,
         maxstacksize=maxstack,
         code=out_code,
-        consts=consts,
+        consts=_sanitize_globals(_decrypt_consts(consts, out_code), out_code),
         protos=protos,
         lines=[],
         locals=locals_,
