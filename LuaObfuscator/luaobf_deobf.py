@@ -985,8 +985,256 @@ def deserialize(data: bytes):
 
 def _unluac_classpath():
     here = os.path.dirname(os.path.abspath(__file__))
-    cp = os.path.join(here, "vendor")
-    return cp if os.path.isdir(os.path.join(cp, "unluac")) else None
+    vendor = os.path.join(here, "vendor")
+    jar = os.path.join(vendor, "unluac.jar")
+    if os.path.isfile(jar):
+        return jar
+    if os.path.isdir(os.path.join(vendor, "unluac")):
+        return vendor
+    return None
+
+
+def _long_bracket_open(text: str, i: int):
+    if i >= len(text) or text[i] != "[":
+        return None
+    j, lvl = i + 1, 0
+    while j < len(text) and text[j] == "=":
+        lvl += 1
+        j += 1
+    return lvl if j < len(text) and text[j] == "[" else None
+
+
+def _skip_long(text: str, i: int, lvl: int) -> int:
+    close = "]" + "=" * lvl + "]"
+    j = text.find(close, i + 2 + lvl)
+    return len(text) if j < 0 else j + len(close)
+
+
+def _skip_quoted(text: str, i: int) -> int:
+    q, j, n = text[i], i + 1, len(text)
+    while j < n:
+        c = text[j]
+        if c == "\\":
+            j += 2
+            continue
+        if c == q:
+            return j + 1
+        if c == "\n":
+            return j
+        j += 1
+    return n
+
+
+def _iter_ident_tokens(text: str):
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == "-" and i + 1 < n and text[i + 1] == "-":
+            j = i + 2
+            lvl = _long_bracket_open(text, j)
+            if lvl is not None:
+                i = _skip_long(text, j, lvl)
+            else:
+                k = text.find("\n", j)
+                i = n if k < 0 else k + 1
+            continue
+        if c in ("'", '"'):
+            i = _skip_quoted(text, i)
+            continue
+        if c == "[":
+            lvl = _long_bracket_open(text, i)
+            if lvl is not None:
+                i = _skip_long(text, i, lvl)
+                continue
+        if c.isalpha() or c == "_":
+            j = i + 1
+            while j < n and (text[j].isalnum() or text[j] == "_"):
+                j += 1
+            yield text[i:j], i, j
+            i = j
+            continue
+        i += 1
+
+
+def _apply_text_edits(text: str, edits) -> str:
+    for start, end, replacement in sorted(edits, reverse=True):
+        text = text[:start] + replacement + text[end:]
+    return text
+
+
+def _merge_else_if(text: str):
+    tokens = list(_iter_ident_tokens(text))
+    edits = []
+    for i, (word, start, end) in enumerate(tokens):
+        if word != "else" or i + 2 >= len(tokens):
+            continue
+        if tokens[i + 1][0] != "if" or text[end:tokens[i + 1][1]].strip():
+            continue
+        depth = 1
+        pending_do = False
+        close_i = None
+        for j in range(i + 2, len(tokens)):
+            word = tokens[j][0]
+            if word in ("if", "function", "repeat"):
+                depth += 1
+                pending_do = False
+            elif word in ("while", "for"):
+                depth += 1
+                pending_do = True
+            elif word == "do":
+                if pending_do:
+                    pending_do = False
+                else:
+                    depth += 1
+            elif word in ("end", "until"):
+                pending_do = False
+                depth -= 1
+                if depth == 0:
+                    close_i = j
+                    break
+        if close_i is None or close_i + 1 >= len(tokens):
+            continue
+        next_word, next_start, next_end = tokens[close_i + 1]
+        close_start, close_end = tokens[close_i][1:]
+        if next_word != "else" or text[close_end:next_start].strip():
+            continue
+        edits.extend(((start, end, "elseif"),
+                      (tokens[i + 1][1], tokens[i + 1][2], ""),
+                      (close_start, close_end, "")))
+        if i and tokens[i - 1][0] == "end":
+            prev_start, prev_end = tokens[i - 1][1:]
+            if not text[prev_end:start].strip():
+                edits.append((prev_start, prev_end, ""))
+        if close_i + 2 < len(tokens) and tokens[close_i + 2][0] == "else":
+            duplicate_start, duplicate_end = tokens[close_i + 2][1:]
+            if not text[next_end:duplicate_start].strip():
+                edits.append((duplicate_start, duplicate_end, ""))
+    return (_apply_text_edits(text, edits), True) if edits else (text, False)
+
+
+def _balance_unluac_blocks(text: str) -> str:
+    tokens = list(_iter_ident_tokens(text))
+    edits = []
+    for previous, current in zip(tokens, tokens[1:]):
+        if previous[0] == current[0] == "else" and not text[previous[2]:current[1]].strip():
+            edits.append((current[1], current[2], ""))
+    text = _apply_text_edits(text, edits)
+
+    frames = []
+    pending_do = 0
+    repairs = []
+    for word, start, _end in _iter_ident_tokens(text):
+        if word in ("if", "function", "repeat"):
+            frames.append([word, False])
+        elif word in ("while", "for"):
+            frames.append(["loop", False])
+            pending_do += 1
+        elif word == "do":
+            if pending_do:
+                pending_do -= 1
+            else:
+                frames.append(["do", False])
+        elif word in ("else", "elseif"):
+            target = next((i for i in range(len(frames) - 1, -1, -1)
+                           if frames[i][0] == "if" and not frames[i][1]), None)
+            if target is None:
+                repairs.append((start, start + len(word), ""))
+                continue
+            if target < len(frames) - 1:
+                indent = text[text.rfind("\n", 0, start) + 1:start]
+                repairs.append((start, start, ("end\n" + indent) * (len(frames) - target - 1)))
+                del frames[target + 1:]
+            if word == "else":
+                frames[target][1] = True
+        elif word == "end":
+            if frames:
+                frames.pop()
+        elif word == "until":
+            for i in range(len(frames) - 1, -1, -1):
+                if frames[i][0] == "repeat":
+                    del frames[i:]
+                    break
+    text = _apply_text_edits(text, repairs)
+
+    frames = []
+    pending_do = 0
+    for word, _start, _end in _iter_ident_tokens(text):
+        if word in ("if", "function", "repeat"):
+            frames.append(word)
+        elif word in ("while", "for"):
+            frames.append("loop")
+            pending_do += 1
+        elif word == "do":
+            if pending_do:
+                pending_do -= 1
+            else:
+                frames.append("do")
+        elif word == "end":
+            if frames:
+                frames.pop()
+        elif word == "until":
+            for i in range(len(frames) - 1, -1, -1):
+                if frames[i] == "repeat":
+                    del frames[i:]
+                    break
+    if frames:
+        closers = ["until true" if frame == "repeat" else "end"
+                   for frame in reversed(frames)]
+        text += "\n" + "\n".join(closers) + "\n"
+    return text
+
+
+def _repair_unluac_blocks(text: str) -> str:
+    text, changed = _merge_else_if(text)
+    return _balance_unluac_blocks(text) if changed else text
+
+
+def _sanitize_unluac_lua(text: str) -> str:
+    text = _repair_unluac_blocks(text)
+    blocks = []
+    function_loop_depths = []
+    loop_depth = 0
+    pending_do = False
+    edits = []
+    for word, start, end in _iter_ident_tokens(text):
+        if word in ("while", "for"):
+            blocks.append("loop")
+            loop_depth += 1
+            pending_do = True
+        elif word == "repeat":
+            blocks.append("loop")
+            loop_depth += 1
+            pending_do = False
+        elif word == "function":
+            blocks.append("function")
+            function_loop_depths.append(loop_depth)
+            pending_do = False
+        elif word == "if":
+            blocks.append("if")
+            pending_do = False
+        elif word == "do":
+            if pending_do:
+                pending_do = False
+            else:
+                blocks.append("do")
+        elif word == "end":
+            pending_do = False
+            if blocks:
+                block = blocks.pop()
+                if block == "loop":
+                    loop_depth -= 1
+                elif block == "function" and function_loop_depths:
+                    function_loop_depths.pop()
+        elif word == "until":
+            pending_do = False
+            if blocks and blocks.pop() == "loop":
+                loop_depth -= 1
+        elif word == "break":
+            pending_do = False
+            function_base = function_loop_depths[-1] if function_loop_depths else 0
+            if loop_depth <= function_base:
+                edits.append((start, end, ""))
+    return _apply_text_edits(text, edits)
 
 
 def decompile_vm(src: str, data: bytes):
@@ -996,17 +1244,19 @@ def decompile_vm(src: str, data: bytes):
     blob, fn = V.vm_to_lua_chunk(src, data)
     cp = _unluac_classpath()
     if not cp:
-        raise RuntimeError("unluac classes not found under vendor/unluac")
+        raise RuntimeError("unluac not found (expected vendor/unluac.jar)")
     with tempfile.TemporaryDirectory() as td:
         luac = os.path.join(td, "chunk.luac")
         with open(luac, "wb") as f:
             f.write(blob)
         p = subprocess.run(["java", "-cp", cp, "unluac.Main", luac],
-                           capture_output=True, text=True, errors="replace")
-    if p.returncode != 0 or "Exception" in p.stderr:
-        tail = (p.stderr.strip().splitlines() or ["unluac failed"])[-1]
+                           capture_output=True)
+    if p.returncode != 0 or b"Exception" in p.stderr:
+        tail = (p.stderr.decode("latin-1").strip().splitlines()
+                or ["unluac failed"])[-1]
         raise RuntimeError(tail)
-    return p.stdout, fn
+    text = p.stdout.decode("latin-1").replace("\r\n", "\n").replace("\r", "\n")
+    return _sanitize_unluac_lua(text), fn
 
 
 def main():
@@ -1039,7 +1289,7 @@ def main():
                       f"{len(fn['consts'])} constants, "
                       f"{n_raw} unmapped op(s)", file=sys.stderr)
                 if args.output:
-                    with open(args.output, "w", encoding="utf-8") as f:
+                    with open(args.output, "w", encoding="utf-8", newline="\n") as f:
                         f.write(text)
                     print(f"[i] wrote {args.output}", file=sys.stderr)
                 else:
@@ -1057,7 +1307,7 @@ def main():
             print(f"[!] malformed payload ({type(e).__name__}: {e})", file=sys.stderr)
             return 2
         if args.output:
-            with open(args.output, "w", encoding="utf-8") as f:
+            with open(args.output, "w", encoding="utf-8", newline="\n") as f:
                 f.write(text)
             print(f"[i] wrote {args.output}", file=sys.stderr)
         else:
@@ -1071,7 +1321,7 @@ def main():
     print(f"[i] {os.path.basename(args.input)}: string mode, "
           f"{sinfo['count']} literals decrypted", file=sys.stderr)
     if args.output:
-        with open(args.output, "w", encoding="utf-8") as f:
+        with open(args.output, "w", encoding="utf-8", newline="\n") as f:
             f.write(out)
         print(f"[i] wrote {args.output}", file=sys.stderr)
     else:
