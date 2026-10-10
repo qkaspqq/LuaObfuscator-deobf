@@ -62,6 +62,8 @@ def _operand(tok, ins):
 
 
 def _is_fall(seg):
+    if not seg:
+        return True
     return re.fullmatch(r"PC=PC\+[0-9+]+", seg) is not None
 
 
@@ -661,8 +663,100 @@ def _unflatten(body, ctx):
     return _clean_payloads(order, state)
 
 
+def _super_ops(norm, ins):
+    # CALL returning a value, then branch on the first return. The target is
+    # taken only when that value is truthy. Rebase the call frame two registers
+    # forward so CALL results land at A+2, matching the obfuscated handler.
+    call_test = re.fullmatch(
+        r"localV=I\[2\];localV=I\[4\];localV=V\+2;"
+        r"localV=\{R\[V\]\(R\[V\+1\],R\[V\]\)\};"
+        r"forV=1,VdoR\[V\+V\]=V\[V\];end"
+        r"localV=V\[1\];ifVthenR\[V\]=V;PC=I\[3\];"
+        r"elsePC=PC\+1;end", norm)
+    if call_test:
+        a, nresults = _reg(ins, "A"), _reg(ins, "C")
+        return [
+            ("MOVE", a + 2, a, None),
+            ("MOVE", a + 3, a + 1, None),
+            ("MOVE", a + 4, a, None),
+            ("CALL", a + 2, 3, nresults + 2),
+            ("TEST", a + 2, 0, 1),
+            ("JMP", 0, _target_from_b(ins), None),
+        ]
+
+    # The handler appends R[A+1..B] to table R[A] via table.insert.
+    if re.fullmatch(
+        r"localV=I\[2\];localV=R\[V\];"
+        r"forV=V\+1,I\[3\]doV\(V,R\[V\]\);end", norm):
+        a, upper = _reg(ins, "A"), _reg(ins, "B")
+        if upper < a:
+            return None
+        return [("SETLIST", a, upper - a, 1)]
+
+    # TESTSET variant hidden behind an opaque state-machine wrapper. The
+    # handler copies R[C] to R[A] and jumps to B only when R[C] is falsey.
+    if re.fullmatch(
+        r"V=R\[I\[4\]\];ifVthen(?:PC=PC\+1;)?;?elselocalV=0;whiletruedo"
+        r"if\(\(V==0\)or\(\d+==\d+\)\)thenR\[I\[2\]\]=V;"
+        r"PC=I\[3\];;endendend", norm):
+        return [("TESTSET", _reg(ins, "A"), _reg(ins, "C"), 1),
+                ("JMP", 0, _target_from_b(ins), None)]
+
+    # Closing open upvalues at/above A is Lua 5.1 CLOSE. Two equivalent
+    # handler families are used: direct scanning and scanning closure records.
+    if (re.fullmatch(
+            r"localV=I\[2\];localV=\{\};forV=1,#VdolocalV=V\[V\];"
+            r"forV=0,#VdolocalV=V\[V\];localV=V\[1\];localV=V\[2\];"
+            r"if\(\(V==R\)and\(V>=V\)\)thenV\[V\]=V\[V\];V\[1\]=V;"
+            r"endendend", norm)
+            or re.fullmatch(
+            r"V=V\[V\];forV=0,#VdolocalV=V\[V\];localV=V\[1\];"
+            r"localV=V\[2\];if\(\(\(V==R\)and\(V>=V\)\)"
+            r"(?:or\(\d+==\d+\))?\)thenV\[V\]=V\[V\];V\[1\]=V;endend", norm)):
+        return [("CLOSE", _reg(ins, "A"), 0, 0)]
+
+    # Numeric FORLOOP: this family advances R[A], then branches back to B
+    # only while the new index remains within the limit.
+    for_loop = re.fullmatch(
+        r"(?:local)?V=I\[2\];(?:local)?V=R\[V\+2\];"
+        r"(?:local)?V=R\[V\]\+V;R\[V\]=V;"
+        r"(?:if\(V>0\)then|if\(\(\d+<\d+\)and\(V>0\)\)then)"
+        r"if\(V<=R\[V\+1\]\)thenPC=I\[3\];"
+        r"R\[V\+3\]=V;endelseif\(V>=R\[V\+1\]\)then"
+        r"PC=I\[3\];R\[V\+3\]=V;end", norm)
+    if for_loop:
+        gate = re.search(r"\((\d+)<(\d+)\)and", norm)
+        if gate and int(gate.group(1)) >= int(gate.group(2)):
+            return None
+        return [("FORLOOP_CONTINUE", _reg(ins, "A"), _target_from_b(ins), None)]
+
+    # A sibling numeric-loop handler receives an already advanced index; it
+    # jumps to B on exhaustion and otherwise publishes R[A+3].
+    for_exit = re.fullmatch(
+        r"(?:local)?V=I\[2\];(?:local)?V=R\[V\];(?:local)?V=R\[V\+2\];"
+        r"(?:if\(V>0\)then|if\(\(\d+<\d+\)and\(V>0\)\)then)"
+        r"if\(V>R\[V\+1\]\)thenPC=I\[3\];elseR\[V\+3\]=V;end"
+        r"elseif\(V<R\[V\+1\]\)thenPC=I\[3\];"
+        r"elseR\[V\+3\]=V;end", norm)
+    for_exit = for_exit or re.fullmatch(
+        r"(?:local)?V=I\[2\];(?:local)?V=R\[V\];(?:local)?V=R\[V\+2\];"
+        r"if\(V>0\)thenif\((?:\(\d+<\d+\)and)?\(V>R\[V\+1\]\)\)then"
+        r"PC=I\[3\];elseR\[V\+3\]=V;end"
+        r"elseif\(V<R\[V\+1\]\)thenPC=I\[3\];"
+        r"elseR\[V\+3\]=V;end", norm)
+    if for_exit:
+        gate = re.search(r"\((\d+)<(\d+)\)and", norm)
+        if gate and int(gate.group(1)) >= int(gate.group(2)):
+            return None
+        return [("FORLOOP_EXIT", _reg(ins, "A"), _target_from_b(ins), None)]
+    return None
+
+
 def _match(norm, ins):
-    if norm.startswith("if") and norm.endswith("end"):
+    special = _super_ops(norm, ins)
+    if special:
+        return special
+    if norm.startswith("if") and norm.endswith("end"): 
         parts = _split_if(norm)
         if parts:
             ops = _cond_ops(parts[0], parts[1], parts[2], ins)
